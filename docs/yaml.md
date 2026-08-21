@@ -29,7 +29,7 @@ providers:
     model: gpt-5
     api_key: sk-...
     base_url: https://api.openai.com/v1
-    api_mode: auto
+    api_mode: chat
 
 llm:
   max_retries: 1
@@ -88,6 +88,9 @@ dynamic_finalizer:
   llm_max_retries: 1
 
 sandbox_code_generation:
+  enabled: true
+  reasoning_effort: low
+  max_output_tokens: 32768
   llm_max_retries: 1
 ```
 
@@ -97,6 +100,7 @@ LLMプロバイダ設定です。
 
 対応プロバイダ:
 - `openai`
+- `openai_compatible`
 - `ollama`
 - `lmstudio`
 - `openrouter`
@@ -106,7 +110,7 @@ LLMプロバイダ設定です。
 複数が `enabled: true` の場合は以下の順で最初に有効なものが使われます。
 
 ```text
-openai -> ollama -> lmstudio -> openrouter -> azure -> bedrock
+openai -> openai_compatible -> ollama -> lmstudio -> openrouter -> azure -> bedrock
 ```
 
 ### providers.openai
@@ -118,7 +122,7 @@ providers:
     model: gpt-5
     api_key: sk-...
     base_url: https://api.openai.com/v1
-    api_mode: auto
+    api_mode: chat
 ```
 
 項目:
@@ -128,10 +132,45 @@ providers:
 - `base_url`: OpenAI互換APIのURL。環境変数 `OPENAI_BASE_URL` でも可
 - `api_mode`: `auto`、`responses`、`chat`
 
+`api_mode` の既定値は、すべてのプロバイダで `chat` です。
+
 `api_mode`:
 - `auto`: Responses APIを試し、失敗時にChat Completionsへフォールバック
 - `responses`: Responses APIを使う
 - `chat`: Chat Completions APIを使う
+
+### providers.openai_compatible
+
+vLLMやSGLangなど、OpenAI互換APIを提供する任意の推論サーバーに接続します。
+
+```yaml
+providers:
+  openai_compatible:
+    enabled: true
+    model: Qwen/Qwen3.8-27B
+    base_url: http://localhost:8000/v1
+    api_mode: chat
+    request:
+      reasoning_effort: xhigh
+      stream_options:
+        include_usage: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+          preserve_thinking: true
+```
+
+- `base_url` は必須です。
+- `api_key` は任意です。空の場合は内部的にダミー値を使います。
+- モデル名は推論サーバーが公開するIDをそのまま指定します。
+
+### OpenAI互換プロバイダのrequest
+
+`openai`、`openai_compatible`、`ollama`、`lmstudio`、`openrouter` は、プロバイダ配下の `request` をOpenAI SDKのリクエストへ渡します。`extra_body` はモデルや推論サーバー固有のパラメータに利用できます。
+
+`model`、`messages`、`input`、`instructions`、`stream` は予約項目で、`request` に指定してもMaigent側の値が優先されます。`stream_options` はストリーミングChat時だけ送信され、非ストリーミングChatとResponses APIでは除外されます。
+
+値はコード既定値、`request`、呼び出し固有値の順でマージされます。呼び出し固有の出力トークン数、`temperature`、`reasoning_effort` が最優先です。Chatで呼び出し固有値またはYAML値が `reasoning_effort: none` の場合、この項目はAPIへ送信されません。
 
 ## Logging configuration
 
@@ -244,7 +283,7 @@ AWS Bedrockを使います。
 model: gpt-5
 api_key: sk-...
 base_url: https://api.openai.com/v1
-api_mode: auto
+api_mode: chat
 ```
 
 `providers` がある場合は、基本的に有効なproviderの設定が優先されます。
@@ -492,10 +531,16 @@ sandboxで使うPythonコードをLLM生成する場合の設定です。
 
 ```yaml
 sandbox_code_generation:
+  enabled: true
+  reasoning_effort: low
+  max_output_tokens: 32768
   llm_max_retries: 1
 ```
 
 項目:
+- `enabled`: LLMによるPythonコード生成を有効化するか。未指定時は `true`
+- `reasoning_effort`: コード生成時のreasoning effort。`xhigh` も指定可能
+- `max_output_tokens`: コード生成LLMの最大出力トークン数。未指定時は `32768`
 - `llm_max_retries`: コード生成LLMが空応答/None/例外を返した場合の再試行回数
 
 ## rag_decision
@@ -529,13 +574,14 @@ BM25で弱い候補をLLMで関連判定する補助呼び出しのリトライ�
 - `low`
 - `medium`
 - `high`
+- `xhigh`（`sandbox_code_generation` とプロバイダの `request` で指定可能）
 - `true`
 - `false`
 
 `true` は `medium` として扱います。`false` は `none` として扱います。
 
 注意:
-- Chat Completions APIでは `reasoning_effort` は送信されません
+- Chat Completions APIでは `none` 以外を `reasoning_effort` として送信し、`none` は項目自体を省略します
 - Responses APIでは `reasoning: {"effort": ...}` として送信されます
 - プロバイダや互換APIによって対応状況が異なります
 

@@ -85,6 +85,9 @@ def _is_sandbox_result_adequate(ok: bool, output: str) -> bool:
 
 
 def _generate_sandbox_code_with_retries(config, input_text: str) -> str:
+    if getattr(config, "sandbox_code_generation_enabled", True) is False:
+        logger.debug("sandbox_code_generation_skipped reason=disabled")
+        return ""
     attempts = _llm_response_max_retries(config, "sandbox_code_generation") + 1
     last_error = ""
     prompt = input_text
@@ -135,6 +138,8 @@ def _retry_generated_sandbox_after_execution_failure(
     thread_id: int,
     datasets: tuple[SandboxDataset, ...] = (),
 ):
+    if getattr(config, "sandbox_code_generation_enabled", True) is False:
+        return result, generated_code
     attempts = _llm_response_max_retries(config, "sandbox_code_generation")
     for attempt in range(1, attempts + 1):
         prompt = (

@@ -15,6 +15,7 @@ SENSITIVE_KEYS = {
     "api_key",
     "openai_api_key",
     "openrouter_api_key",
+    "openai_compatible_api_key",
     "azure_api_key",
     "azure_openai_api_key",
     "aws_access_key_id",
@@ -22,7 +23,7 @@ SENSITIVE_KEYS = {
     "aws_session_token",
 }
 
-PROVIDER_ORDER = ["openai", "ollama", "lmstudio", "openrouter", "azure", "bedrock"]
+PROVIDER_ORDER = ["openai", "openai_compatible", "ollama", "lmstudio", "openrouter", "azure", "bedrock"]
 
 PROVIDER_ENV_KEYS = {
     "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
@@ -31,7 +32,7 @@ PROVIDER_ENV_KEYS = {
     "bedrock": ("AWS_BEARER_TOKEN_BEDROCK", ""),
 }
 
-OPENAI_COMPATIBLE_PROVIDERS = {"openai", "ollama", "lmstudio", "openrouter"}
+OPENAI_COMPATIBLE_PROVIDERS = {"openai", "openai_compatible", "ollama", "lmstudio", "openrouter"}
 CONTROL_CONFIG_NAMES = {"initial_clarifier", "tool_selector", "dynamic_replanner", "dynamic_finalizer"}
 
 
@@ -101,9 +102,9 @@ class RuntimeConfig:
     def api_mode(self) -> str:
         provider = self.active_provider
         provider_config = self.provider_config(provider) if provider else {}
-        default = "auto" if provider == "openai" else "chat"
+        default = "chat"
         value = str(provider_config.get("api_mode") or self.values.get("api_mode") or self.values.get("openai_api_mode") or default).strip().lower()
-        return value if value in {"auto", "responses", "chat"} else "auto"
+        return value if value in {"auto", "responses", "chat"} else default
 
     @property
     def providers(self) -> dict[str, Any]:
@@ -202,6 +203,34 @@ class RuntimeConfig:
     def final_evaluation_reasoning_effort(self) -> str:
         value = str(self.final_evaluation.get("reasoning_effort", "none")).strip().lower()
         return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
+
+    @property
+    def sandbox_code_generation(self) -> dict[str, Any]:
+        value = self.values.get("sandbox_code_generation", {})
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def sandbox_code_generation_enabled(self) -> bool:
+        return _as_bool(self.sandbox_code_generation.get("enabled", True))
+
+    @property
+    def sandbox_code_generation_max_output_tokens(self) -> int:
+        try:
+            return max(1, int(self.sandbox_code_generation.get("max_output_tokens", 32768)))
+        except (TypeError, ValueError):
+            return 32768
+
+    @property
+    def sandbox_code_generation_reasoning_effort(self) -> str:
+        value = self.sandbox_code_generation.get("reasoning_effort", "none")
+        if isinstance(value, bool):
+            return "medium" if value else "none"
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "on", "yes"}:
+            return "medium"
+        if normalized in {"false", "off", "no"}:
+            return "none"
+        return normalized if normalized in {"none", "minimal", "low", "medium", "high", "xhigh"} else "none"
 
     @property
     def logging(self) -> dict[str, Any]:

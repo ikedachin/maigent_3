@@ -6,6 +6,20 @@ providers:
     # base_url: http://localhost:8000/v1
     api_mode: chat
 
+  openai_compatible:
+    enabled: false
+    model: Qwen/Qwen3.8-27B
+    base_url: http://localhost:8000/v1
+    api_mode: chat
+    request:
+      reasoning_effort: xhigh
+      stream_options:
+        include_usage: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+          preserve_thinking: true
+
   ollama:
     enabled: false
     model: llama3.1
@@ -125,7 +139,7 @@ dynamic_finalizer:
 
 sandbox_code_generation:
   enabled: true
-  reasoning_effort: true
+  reasoning_effort: low
   max_output_tokens: 32768
   llm_max_retries: 3
 

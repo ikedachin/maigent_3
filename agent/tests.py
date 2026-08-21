@@ -4,13 +4,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
+from django.contrib import admin
+from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .access import is_path_allowed, normalize_access_path
 from .config import RuntimeConfig, load_agents_md, load_runtime_config, load_skills
 from .openai_client import stream_response
-from .models import AgentRun, AgentTaskRecord, AgentWorkerRun, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .models import AgentRun, AgentTaskRecord, AgentWorkerRun, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
@@ -93,16 +95,41 @@ class ConfigTests(TestCase):
             self.assertEqual(config.base_url, "http://project")
             self.assertEqual(len(config.sources), 2)
 
-    def test_api_mode_defaults_to_auto_and_accepts_chat(self):
+    def test_api_mode_defaults_to_chat_and_preserves_explicit_auto(self):
         with TemporaryDirectory() as app_dir:
             app = Path(app_dir)
             (app / ".maigent").mkdir()
-            (app / ".maigent" / "config.toml").write_text('model = "m"\napi_mode = "chat"\n')
+            (app / ".maigent" / "config.toml").write_text('model = "m"\n')
 
             with override_settings(BASE_DIR=app):
                 config = load_runtime_config("")
 
             self.assertEqual(config.api_mode, "chat")
+
+        explicit = RuntimeConfig(values={"model": "m", "api_key": "key", "api_mode": "auto"}, sources=[])
+        self.assertEqual(explicit.api_mode, "auto")
+
+    def test_openai_compatible_is_selected_after_openai(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai": {"enabled": False, "model": "gpt"},
+                    "openai_compatible": {
+                        "enabled": True,
+                        "model": "Qwen/Qwen3.8-27B",
+                        "base_url": "http://localhost:8000/v1",
+                    },
+                    "ollama": {"enabled": True, "model": "llama3.1"},
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "openai_compatible")
+        self.assertEqual(config.model, "Qwen/Qwen3.8-27B")
+        self.assertEqual(config.base_url, "http://localhost:8000/v1")
+        self.assertEqual(config.api_mode, "chat")
+        self.assertEqual(config.api_key, "")
 
     def test_provider_config_selects_first_enabled_provider(self):
         config = RuntimeConfig(
@@ -237,6 +264,11 @@ class ConfigTests(TestCase):
                         "  max_output_tokens: 80",
                         "  llm_max_retries: 2",
                         "  reasoning_effort: false",
+                        "sandbox_code_generation:",
+                        "  enabled: true",
+                        "  max_output_tokens: 32768",
+                        "  llm_max_retries: 3",
+                        "  reasoning_effort: xhigh",
                     ]
                 ),
                 encoding="utf-8",
@@ -267,6 +299,10 @@ class ConfigTests(TestCase):
             self.assertEqual(config.control_config("initial_clarifier")["llm_max_retries"], 2)
             self.assertEqual(config.final_evaluation["llm_max_retries"], 2)
             self.assertEqual(config.control_config("dynamic_replanner")["llm_max_retries"], 2)
+            self.assertTrue(config.sandbox_code_generation_enabled)
+            self.assertEqual(config.sandbox_code_generation_max_output_tokens, 32768)
+            self.assertEqual(config.sandbox_code_generation_reasoning_effort, "xhigh")
+            self.assertEqual(config.sandbox_code_generation["llm_max_retries"], 3)
             self.assertEqual(config.enabled_tool_names, {"rag", "file_batch", "sandbox"})
             self.assertTrue(config.tool_enabled("file_batch"))
             self.assertFalse(config.tool_enabled("web_search"))
@@ -2279,19 +2315,27 @@ class ChatFlowTests(TestCase):
 
     @patch("agent.applications.sandbox.generate_sandbox_code")
     def test_sandbox_code_generation_retries_after_policy_rejection(self, mock_generate_sandbox_code):
-        class Config:
-            sandbox_code_generation = {"llm_max_retries": 1}
+        config = RuntimeConfig(values={"sandbox_code_generation": {"llm_max_retries": 1}}, sources=[])
 
         mock_generate_sandbox_code.side_effect = [
             "import pandas as pd\nfile_path = 'test.csv'\ndf = pd.read_csv(file_path)",
             "import io, pandas as pd\ncsv_text='score\\n80\\n'\ndf = pd.read_csv(io.StringIO(csv_text))\nprint(df['score'].sum())",
         ]
 
-        code = _generate_sandbox_code_with_retries(Config(), "test.csvを集計してください")
+        code = _generate_sandbox_code_with_retries(config, "test.csvを集計してください")
 
         self.assertIn("io.StringIO", code)
         self.assertEqual(mock_generate_sandbox_code.call_count, 2)
         self.assertIn("Previous generated code was rejected", mock_generate_sandbox_code.call_args_list[1].args[1])
+
+    @patch("agent.applications.sandbox.generate_sandbox_code")
+    def test_disabled_sandbox_code_generation_skips_llm_call(self, mock_generate_sandbox_code):
+        config = RuntimeConfig(values={"sandbox_code_generation": {"enabled": False}}, sources=[])
+
+        code = _generate_sandbox_code_with_retries(config, "Pythonコードを生成してください")
+
+        self.assertEqual(code, "")
+        mock_generate_sandbox_code.assert_not_called()
 
     def test_sandbox_artifact_payload_is_hidden_from_display_output(self):
         payload = json.dumps(
@@ -3719,6 +3763,68 @@ class AgentsMdAndSkillTests(TestCase):
 
 
 @override_settings(STATICFILES_DIRS=[])
+class AdminTests(TestCase):
+    def setUp(self):
+        self.admin_user = get_user_model().objects.create_superuser(
+            username="admin-test",
+            email="admin@example.com",
+            password="test-password",
+        )
+        self.client.force_login(self.admin_user)
+
+    def test_all_agent_models_are_registered(self):
+        expected_models = {
+            Project,
+            Thread,
+            ProjectAccessPath,
+            Message,
+            AppSetting,
+            FeatureFlag,
+            Automation,
+            ApprovalRequest,
+            AgentRun,
+            AgentWorkerRun,
+            AgentTaskRecord,
+        }
+
+        self.assertTrue(expected_models.issubset(admin.site._registry))
+
+    def test_all_agent_model_changelists_are_accessible(self):
+        models = [
+            Project,
+            Thread,
+            ProjectAccessPath,
+            Message,
+            AppSetting,
+            FeatureFlag,
+            Automation,
+            ApprovalRequest,
+            AgentRun,
+            AgentWorkerRun,
+            AgentTaskRecord,
+        ]
+
+        for model in models:
+            with self.subTest(model=model.__name__):
+                url = reverse(f"admin:{model._meta.app_label}_{model._meta.model_name}_changelist")
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+
+    def test_app_setting_can_be_edited_in_admin(self):
+        setting = AppSetting.objects.create(key="admin_test", value="before")
+        url = reverse("admin:agent_appsetting_change", args=[setting.pk])
+
+        response = self.client.post(
+            url,
+            {"key": "admin_test", "value": "after", "_save": "Save"},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        setting.refresh_from_db()
+        self.assertEqual(setting.value, "after")
+
+
+@override_settings(STATICFILES_DIRS=[])
 class DirectoryBrowseTests(TestCase):
     def test_browse_directories_lists_visible_child_folders(self):
         with TemporaryDirectory() as root_dir:
@@ -3745,6 +3851,30 @@ class DirectoryBrowseTests(TestCase):
 
 
 class OpenAIClientTests(TestCase):
+    @patch("agent.openai_client._complete_response")
+    def test_generate_sandbox_code_passes_section_options(self, mock_complete_response):
+        config = RuntimeConfig(
+            values={
+                "model": "model",
+                "api_key": "key",
+                "sandbox_code_generation": {
+                    "enabled": True,
+                    "max_output_tokens": 32768,
+                    "reasoning_effort": "xhigh",
+                },
+            },
+            sources=[],
+        )
+        mock_complete_response.return_value = "```python\nprint('ok')\n```"
+
+        from .openai_client import generate_sandbox_code
+
+        result = generate_sandbox_code(config, "generate code")
+
+        self.assertEqual(result, "print('ok')")
+        self.assertEqual(mock_complete_response.call_args.kwargs["max_output_tokens"], 32768)
+        self.assertEqual(mock_complete_response.call_args.kwargs["reasoning_effort"], "xhigh")
+
     def test_auto_mode_falls_back_to_chat_completions(self):
         class Config:
             model = "model"
@@ -3881,6 +4011,215 @@ class OpenAIClientTests(TestCase):
         self.assertEqual(result, "local ok")
         mock_openai.assert_called_once_with(api_key="ollama", base_url="http://localhost:11434/v1")
 
+    def test_openai_compatible_uses_dummy_key_and_merges_chat_request_options(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai_compatible": {
+                        "enabled": True,
+                        "model": "Qwen/Qwen3.8-27B",
+                        "base_url": "http://localhost:8000/v1",
+                        "request": {
+                            "model": "ignored-model",
+                            "messages": [{"role": "user", "content": "ignored"}],
+                            "input": "ignored-input",
+                            "instructions": "ignored-instructions",
+                            "stream": True,
+                            "max_tokens": 16,
+                            "max_completion_tokens": 32,
+                            "temperature": 0.7,
+                            "reasoning_effort": "xhigh",
+                            "stream_options": {"include_usage": True},
+                            "extra_body": {
+                                "chat_template_kwargs": {
+                                    "enable_thinking": True,
+                                    "preserve_thinking": True,
+                                }
+                            },
+                        },
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = type("Message", (), {"content": "qwen ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()) as mock_openai:
+            from .openai_client import complete_response
+
+            result = complete_response(
+                config,
+                "hello",
+                "system",
+                max_output_tokens=64,
+                reasoning_effort="low",
+                temperature=0,
+            )
+
+        self.assertEqual(result, "qwen ok")
+        mock_openai.assert_called_once_with(api_key="openai_compatible", base_url="http://localhost:8000/v1")
+        request = Client.chat.completions.kwargs
+        self.assertEqual(request["model"], "Qwen/Qwen3.8-27B")
+        self.assertEqual(request["messages"], [{"role": "system", "content": "system"}, {"role": "user", "content": "hello"}])
+        self.assertFalse(request["stream"])
+        self.assertNotIn("input", request)
+        self.assertNotIn("instructions", request)
+        self.assertNotIn("stream_options", request)
+        self.assertEqual(request["max_tokens"], 64)
+        self.assertNotIn("max_completion_tokens", request)
+        self.assertEqual(request["temperature"], 0)
+        self.assertEqual(request["reasoning_effort"], "low")
+        self.assertEqual(
+            request["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+        )
+
+    def test_chat_reasoning_effort_none_removes_provider_default(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai_compatible": {
+                        "enabled": True,
+                        "model": "model",
+                        "base_url": "http://localhost:8000/v1",
+                        "request": {"reasoning_effort": "xhigh"},
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = type("Message", (), {"content": "ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            complete_response(config, "hello", reasoning_effort="none")
+
+        self.assertNotIn("reasoning_effort", Client.chat.completions.kwargs)
+
+    def test_streaming_chat_keeps_stream_options_and_reserved_fields(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai_compatible": {
+                        "enabled": True,
+                        "model": "served-model",
+                        "base_url": "http://localhost:8000/v1",
+                        "request": {
+                            "model": "ignored-model",
+                            "messages": [],
+                            "stream": False,
+                            "reasoning_effort": "none",
+                            "stream_options": {"include_usage": True},
+                        },
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                delta = type("Delta", (), {"content": "ok"})()
+                choice = type("Choice", (), {"delta": delta})()
+                return iter([type("Chunk", (), {"id": "chat_1", "choices": [choice]})()])
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            events = list(stream_response(config, "hello", "system"))
+
+        self.assertEqual(events, [("delta", "ok"), ("response_id", "chat_1")])
+        request = Client.chat.completions.kwargs
+        self.assertEqual(request["model"], "served-model")
+        self.assertEqual(request["messages"], [{"role": "system", "content": "system"}, {"role": "user", "content": "hello"}])
+        self.assertTrue(request["stream"])
+        self.assertEqual(request["stream_options"], {"include_usage": True})
+        self.assertNotIn("reasoning_effort", request)
+
+    def test_openai_compatible_requires_base_url(self):
+        config = RuntimeConfig(
+            values={"providers": {"openai_compatible": {"enabled": True, "model": "model"}}},
+            sources=[],
+        )
+
+        with self.assertRaisesRegex(ValueError, "base_url"):
+            list(stream_response(config, "hello"))
+
+    def test_request_options_are_shared_by_openai_compatible_providers(self):
+        provider_configs = {
+            "openai": {"api_key": "key"},
+            "openai_compatible": {"base_url": "http://localhost:8000/v1"},
+            "ollama": {},
+            "lmstudio": {},
+            "openrouter": {"api_key": "key"},
+        }
+
+        for provider, provider_values in provider_configs.items():
+            with self.subTest(provider=provider):
+                config = RuntimeConfig(
+                    values={
+                        "providers": {
+                            provider: {
+                                "enabled": True,
+                                "model": "model",
+                                "request": {"extra_body": {"top_k": 20}},
+                                **provider_values,
+                            }
+                        }
+                    },
+                    sources=[],
+                )
+
+                class ChatCompletions:
+                    def create(self, **kwargs):
+                        self.kwargs = kwargs
+                        message = type("Message", (), {"content": "ok"})()
+                        choice = type("Choice", (), {"message": message})()
+                        return type("Response", (), {"choices": [choice]})()
+
+                class Chat:
+                    completions = ChatCompletions()
+
+                class Client:
+                    chat = Chat()
+
+                with patch("agent.openai_client.OpenAI", return_value=Client()):
+                    from .openai_client import complete_response
+
+                    complete_response(config, "hello")
+
+                self.assertEqual(Client.chat.completions.kwargs["extra_body"], {"top_k": 20})
+
     def test_azure_provider_uses_azure_client(self):
         config = RuntimeConfig(
             values={
@@ -3967,6 +4306,50 @@ class OpenAIClientTests(TestCase):
         self.assertEqual(Client.responses.kwargs["max_output_tokens"], 64)
         self.assertEqual(Client.responses.kwargs["reasoning"], {"effort": "none"})
         self.assertEqual(Client.responses.kwargs["temperature"], 0)
+
+    def test_responses_api_merges_request_options_and_ignores_reserved_fields(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai": {
+                        "enabled": True,
+                        "model": "gpt-test",
+                        "api_key": "key",
+                        "api_mode": "responses",
+                        "request": {
+                            "model": "ignored-model",
+                            "input": "ignored-input",
+                            "instructions": "ignored-instructions",
+                            "stream": True,
+                            "stream_options": {"include_usage": True},
+                            "extra_body": {"custom_option": True},
+                        },
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class Responses:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return type("Response", (), {"output_text": "ok"})()
+
+        class Client:
+            responses = Responses()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello", "system")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(Client.responses.kwargs["model"], "gpt-test")
+        self.assertEqual(Client.responses.kwargs["input"], "hello")
+        self.assertEqual(Client.responses.kwargs["instructions"], "system")
+        self.assertNotIn("stream", Client.responses.kwargs)
+        self.assertNotIn("stream_options", Client.responses.kwargs)
+        self.assertEqual(Client.responses.kwargs["extra_body"], {"custom_option": True})
 
 
 class WebSearchTests(TestCase):

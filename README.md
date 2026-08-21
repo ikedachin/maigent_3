@@ -11,9 +11,12 @@
 ```bash
 uv sync
 uv run python manage.py migrate
+uv run python manage.py createsuperuser
 docker build -t maigent-sandbox:py311 docker/sandbox
 uv run python manage.py runserver
 ```
+
+データベースの閲覧・編集は `http://127.0.0.1:8000/admin/` から行えます。初回だけ `createsuperuser` で管理者を作成し、そのアカウントでログインしてください。
 
 設定は `config.toml` または `config.yaml` で管理します。読み込み順は `~/.maigent/`、アプリ直下の `.maigent/`、プロジェクト内の `.maigent/` です。後から読み込まれた設定が前の設定を上書きします。
 
@@ -21,7 +24,7 @@ uv run python manage.py runserver
 model: gpt-5
 api_key: sk-...
 base_url: https://api.openai.com/v1
-api_mode: auto
+api_mode: chat
 
 llm:
   max_retries: 1
@@ -77,6 +80,9 @@ multi_agent:
   progress_visible: true
 
 sandbox_code_generation:
+  enabled: true
+  reasoning_effort: low
+  max_output_tokens: 32768
   llm_max_retries: 1
 ```
 
@@ -100,7 +106,7 @@ YAMLローダーはこのアプリ内の簡易実装です。基本的なネス�
 
 ## LLM provider configuration
 
-`providers.<name>.enabled` で使用するAPIを切り替えられます。複数を `true` にした場合は `openai`, `ollama`, `lmstudio`, `openrouter`, `azure`, `bedrock` の順で最初に有効なものを使用します。`providers` を書いたうえで全て `false` にした場合、active provider はなしになり、モデル未設定として扱われます。
+`providers.<name>.enabled` で使用するAPIを切り替えられます。複数を `true` にした場合は `openai`, `openai_compatible`, `ollama`, `lmstudio`, `openrouter`, `azure`, `bedrock` の順で最初に有効なものを使用します。`providers` を書いたうえで全て `false` にした場合、active provider はなしになり、モデル未設定として扱われます。
 ちなみに、作者が確認できているのはOpenAI互換APIのみです。
 
 ```yaml
@@ -109,7 +115,21 @@ providers:
     enabled: true
     model: gpt-5
     api_key: sk-...
-    api_mode: auto
+    api_mode: chat
+
+  openai_compatible:
+    enabled: false
+    model: Qwen/Qwen3.8-27B
+    base_url: http://localhost:8000/v1
+    api_mode: chat
+    request:
+      reasoning_effort: xhigh
+      stream_options:
+        include_usage: true
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+          preserve_thinking: true
 
   ollama:
     enabled: false
@@ -151,7 +171,9 @@ providers:
     # aws_session_token: ...
 ```
 
-OllamaとLM StudioはOpenAI互換の `/v1` エンドポイントを使うため、APIキー未指定でもローカル用のダミーキーで接続します。OpenRouterはOpenAI互換APIとして扱い、任意で `http_referer` と `x_title` をヘッダーへ付与できます。Azureは `AzureOpenAI` クライアント、AWS Bedrockは `boto3` の Converse API を使用します。
+`openai_compatible` はvLLMやSGLangなどの汎用OpenAI互換エンドポイント向けで、`base_url` は必須、APIキーは任意です。OllamaとLM StudioもAPIキー未指定時はローカル用のダミーキーで接続します。OpenRouterは任意で `http_referer` と `x_title` をヘッダーへ付与できます。Azureは `AzureOpenAI` クライアント、AWS Bedrockは `boto3` の Converse API を使用します。
+
+OpenAI互換プロバイダでは、`request` 配下の値をSDKリクエストへ渡せます。`extra_body` はQwenなどのモデル固有設定に利用できます。`model`、`messages`、`input`、`instructions`、`stream` はMaigentが管理するため、`request` に書いても上書きされません。`stream_options` はストリーミングChat時だけ使われます。マージ順はコード既定値、`request`、呼び出し固有値の順で、呼び出し固有のトークン数・温度・reasoning設定が優先されます。Chatの `reasoning_effort: none` はAPIへ送信しません。
 
 環境変数も利用できます。OpenAIは `OPENAI_API_KEY` / `OPENAI_BASE_URL`、OpenRouterは `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL`、Azureは `AZURE_OPENAI_API_KEY` / `AZURE_OPENAI_ENDPOINT`、Bedrockは `AWS_REGION` / `AWS_DEFAULT_REGION` / `AWS_PROFILE` を参照します。Bedrockは設定ファイル内の `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token` も利用できます。
 
@@ -283,7 +305,7 @@ flowchart LR
     Access["Path access control\nagent/access.py"]
     Docker["Docker sandbox\nmaigent-sandbox:py311"]
     Files["Allowed local files"]
-    LLM["LLM providers\nOpenAI / Ollama / LM Studio / OpenRouter / Azure / Bedrock"]
+    LLM["LLM providers\nOpenAI / OpenAI-compatible / Ollama / LM Studio / OpenRouter / Azure / Bedrock"]
 
     Browser <--> Views
     Views <--> Models
@@ -330,7 +352,7 @@ flowchart TD
     EnvModel --> Runtime["RuntimeConfig(values, sources)"]
     Runtime --> Providers{"providers exists?"}
     Providers -- "No" --> Legacy["Use legacy OpenAI-compatible config\nmodel/api_key/base_url/api_mode"]
-    Providers -- "Yes" --> FirstEnabled["Select first enabled provider\nopenai -> ollama -> lmstudio -> openrouter -> azure -> bedrock"]
+    Providers -- "Yes" --> FirstEnabled["Select first enabled provider\nopenai -> openai_compatible -> ollama -> lmstudio -> openrouter -> azure -> bedrock"]
     FirstEnabled --> AnyEnabled{"Any provider enabled?"}
     AnyEnabled -- "No" --> Disabled["No active provider\nmodel resolves empty"]
     AnyEnabled -- "Yes" --> Active["Resolve provider-specific\nmodel, key, endpoint, api_mode,\nheaders, Azure settings, Bedrock settings"]
@@ -346,6 +368,7 @@ flowchart TD
     Validate --> Provider{"active_provider"}
 
     Provider -- "openai" --> OpenAICompat["OpenAI-compatible client"]
+    Provider -- "openai_compatible" --> OpenAICompat
     Provider -- "ollama" --> OpenAICompat
     Provider -- "lmstudio" --> OpenAICompat
     Provider -- "openrouter" --> OpenAICompat

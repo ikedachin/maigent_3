@@ -3,7 +3,7 @@ from collections.abc import Iterable
 
 from openai import AzureOpenAI, OpenAI
 
-from .config import RuntimeConfig
+from .config import OPENAI_COMPATIBLE_PROVIDERS, RuntimeConfig
 from .prompt_loader import load_prompt
 
 
@@ -11,8 +11,16 @@ logger = logging.getLogger(__name__)
 
 
 def generate_sandbox_code(config: RuntimeConfig, input_text: str) -> str:
+    if not config.sandbox_code_generation_enabled:
+        return ""
     instructions = load_prompt("sandbox_code_generation_instructions.txt")
-    text = _complete_response(config, input_text, instructions)
+    text = _complete_response(
+        config,
+        input_text,
+        instructions,
+        max_output_tokens=config.sandbox_code_generation_max_output_tokens,
+        reasoning_effort=config.sandbox_code_generation_reasoning_effort,
+    )
     return _extract_code(text)
 
 
@@ -66,6 +74,10 @@ def _stream_responses(client: OpenAI, config: RuntimeConfig, input_text: str, in
         "input": input_text,
         "stream": True,
     }
+    request.update(_provider_request_options(config, api_mode="responses", streaming=True))
+    request["model"] = config.model
+    request["input"] = input_text
+    request["stream"] = True
     if instructions:
         request["instructions"] = instructions
 
@@ -105,7 +117,15 @@ def _complete_response(
     client = _build_openai_compatible_client(config)
 
     if config.api_mode == "chat":
-        return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens, temperature=temperature)
+        return _complete_chat_completions(
+            client,
+            config,
+            input_text,
+            instructions,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+        )
     if config.api_mode == "responses":
         return _complete_responses(
             client,
@@ -130,7 +150,15 @@ def _complete_response(
             return response
     except Exception:
         pass
-    return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens, temperature=temperature)
+    return _complete_chat_completions(
+        client,
+        config,
+        input_text,
+        instructions,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
+        temperature=temperature,
+    )
 
 
 def _complete_responses(
@@ -143,9 +171,14 @@ def _complete_responses(
     temperature: float | None = None,
 ) -> str:
     request = {"model": config.model, "input": input_text}
+    request.update(_provider_request_options(config, api_mode="responses", streaming=False))
+    request["model"] = config.model
+    request["input"] = input_text
     if instructions:
         request["instructions"] = instructions
     if max_output_tokens:
+        request.pop("max_tokens", None)
+        request.pop("max_completion_tokens", None)
         request["max_output_tokens"] = max_output_tokens
     if reasoning_effort:
         request["reasoning"] = {"effort": reasoning_effort}
@@ -170,6 +203,7 @@ def _complete_chat_completions(
     input_text: str,
     instructions: str = "",
     max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
     temperature: float | None = None,
 ) -> str:
     messages = []
@@ -177,8 +211,19 @@ def _complete_chat_completions(
         messages.append({"role": "system", "content": instructions})
     messages.append({"role": "user", "content": input_text})
     request = {"model": config.model, "messages": messages, "stream": False}
+    request.update(_provider_request_options(config, api_mode="chat", streaming=False))
+    request["model"] = config.model
+    request["messages"] = messages
+    request["stream"] = False
     if max_output_tokens:
+        request.pop("max_completion_tokens", None)
         request["max_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        normalized_effort = str(reasoning_effort).strip().lower()
+        if normalized_effort and normalized_effort != "none":
+            request["reasoning_effort"] = normalized_effort
+        else:
+            request.pop("reasoning_effort", None)
     if temperature is not None:
         request["temperature"] = temperature
     response = client.chat.completions.create(**request)
@@ -303,11 +348,12 @@ def _stream_chat_completions(client: OpenAI, config: RuntimeConfig, input_text: 
     messages.append({"role": "user", "content": input_text})
 
     response_id = ""
-    stream = client.chat.completions.create(
-        model=config.model,
-        messages=messages,
-        stream=True,
-    )
+    request = {"model": config.model, "messages": messages, "stream": True}
+    request.update(_provider_request_options(config, api_mode="chat", streaming=True))
+    request["model"] = config.model
+    request["messages"] = messages
+    request["stream"] = True
+    stream = client.chat.completions.create(**request)
     for chunk in stream:
         response_id = getattr(chunk, "id", "") or response_id
         choices = getattr(chunk, "choices", None) or []
@@ -331,6 +377,8 @@ def _validate_config(config: RuntimeConfig) -> None:
         raise ValueError("モデルが未設定です。config.tomlまたはconfig.yamlに model または default_model を設定してください。")
     if provider in {"openai", "openrouter", "azure"} and not config.api_key:
         raise ValueError(f"{provider} のAPIキーが未設定です。設定ファイルまたは環境変数を設定してください。")
+    if provider == "openai_compatible" and not config.base_url:
+        raise ValueError("openai_compatible の base_url が未設定です。providers.openai_compatible.base_url を設定してください。")
     if provider == "azure" and not getattr(config, "azure_endpoint", ""):
         raise ValueError("azure の endpoint が未設定です。providers.azure.azure_endpoint または AZURE_OPENAI_ENDPOINT を設定してください。")
     if provider == "bedrock" and not getattr(config, "bedrock_region", ""):
@@ -340,7 +388,7 @@ def _validate_config(config: RuntimeConfig) -> None:
 def _build_openai_compatible_client(config: RuntimeConfig) -> OpenAI:
     provider = _active_provider(config)
     api_key = config.api_key
-    if provider in {"ollama", "lmstudio"} and not api_key:
+    if provider in {"openai_compatible", "ollama", "lmstudio"} and not api_key:
         api_key = provider
     kwargs = {"api_key": api_key}
     if config.base_url:
@@ -349,6 +397,27 @@ def _build_openai_compatible_client(config: RuntimeConfig) -> OpenAI:
     if headers:
         kwargs["default_headers"] = headers
     return OpenAI(**kwargs)
+
+
+_RESERVED_REQUEST_KEYS = {"model", "messages", "input", "instructions", "stream"}
+
+
+def _provider_request_options(config: RuntimeConfig, *, api_mode: str, streaming: bool) -> dict[str, object]:
+    provider = _active_provider(config)
+    if provider not in OPENAI_COMPATIBLE_PROVIDERS:
+        return {}
+    if not hasattr(config, "provider_config"):
+        return {}
+    provider_config = config.provider_config(provider)
+    raw_request = provider_config.get("request", {})
+    if not isinstance(raw_request, dict):
+        return {}
+    request = {str(key): value for key, value in raw_request.items() if str(key) not in _RESERVED_REQUEST_KEYS}
+    if api_mode != "chat" or not streaming:
+        request.pop("stream_options", None)
+    if api_mode == "chat" and str(request.get("reasoning_effort", "")).strip().lower() == "none":
+        request.pop("reasoning_effort", None)
+    return request
 
 
 def _provider_headers(config: RuntimeConfig) -> dict[str, str]:
